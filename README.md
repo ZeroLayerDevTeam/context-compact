@@ -36,7 +36,7 @@ Requirements: Python 3.8+, Ollama with a chat model pulled (default `gemma3:12b`
 VRAM), and Claude Code.
 
 ```sh
-git clone https://github.com/MattBlackDev1987/context-compact.git
+git clone https://github.com/ZeroLayerDevTeam/context-compact.git
 cd context-compact
 ollama pull gemma3:12b
 python3 compactador.py            # listens on 0.0.0.0:8787
