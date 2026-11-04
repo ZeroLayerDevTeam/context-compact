@@ -6,7 +6,8 @@ máquina: ~/.claude y todas las cuentas de ccm (~/.ccm/accounts/*).
   python configurar.py http://127.0.0.1:8787         # la máquina donde corre el proxy
   python configurar.py --quitar                       # vuelve a hablar directo con la API
 
-Sube CLAUDE_AUTOCOMPACT_PCT_OVERRIDE a 85: la compactación nativa queda solo como red de
+Pone ENABLE_TOOL_SEARCH=true (herramientas MCP diferidas: detrás de un gateway Claude Code
+las cargaría todas en cada petición). Sube CLAUDE_AUTOCOMPACT_PCT_OVERRIDE a 85: la compactación nativa queda solo como red de
 seguridad para cuando el compactador no pueda resumir (Ollama caído). Con --quitar vuelve a 30.
 """
 import glob
@@ -31,6 +32,9 @@ for path in files:
     else:
         env["ANTHROPIC_BASE_URL"] = url
         env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = "85"
+        # Con ANTHROPIC_BASE_URL (gateway) o "auto" (umbral 10 % = 100K en contexto 1M) las
+        # herramientas MCP se mandan enteras en cada petición (~60K tokens con 135 tools).
+        env["ENABLE_TOOL_SEARCH"] = "true"
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")

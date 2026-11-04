@@ -275,7 +275,44 @@ LOCK = threading.Lock()
 STATES = {}      # key -> estado aplicado {cut, hash, summary, files_mod, files_read, saved, t}
 JOBS = set()     # keys con resumen en curso
 FAILED = {}      # key -> instante del último fallo
-STATS = {"requests": 0, "compacted": 0, "summaries": 0, "errors": 0, "saved_tokens": 0}
+STATS = {"requests": 0, "compacted": 0, "summaries": 0, "errors": 0, "saved_tokens": 0,
+         # usage real devuelto por Anthropic (todas las peticiones /v1/messages)
+         "input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+         "output_tokens": 0}
+USAGE_FIELDS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+USAGE_RE = re.compile(rb'"(input_tokens|cache_read_input_tokens|cache_creation_input_tokens|output_tokens)"\s*:\s*(\d+)')
+
+
+def parse_usage(data):
+    """Máximo de cada campo de usage en una respuesta (JSON o SSE: message_start + message_delta)."""
+    u = dict.fromkeys(USAGE_FIELDS, 0)
+    for k, v in USAGE_RE.findall(data):
+        k = k.decode()
+        u[k] = max(u[k], int(v))
+    return u
+
+
+RATIO = {}       # key -> tokens reales / estimados (calibra el estimador con el usage de Anthropic)
+
+
+def est_body(body):
+    """Estimación de todo el input con el mismo estimador que compactable_tokens."""
+    fixed = sum(len(json.dumps(body.get(k) or "", ensure_ascii=False)) for k in ("system", "tools"))
+    return fixed / CHARS_PER_TOKEN + sum(est_msg(m) for m in body.get("messages") or [])
+
+
+def record_usage(u, compacted, key, conv=None, est=0.0):
+    total = u["input_tokens"] + u["cache_read_input_tokens"] + u["cache_creation_input_tokens"]
+    with LOCK:
+        for k in USAGE_FIELDS:
+            STATS[k] += u[k]
+        if conv and est > 1000 and total:
+            RATIO[conv] = min(max(total / est, 0.5), 5.0)
+    if total:
+        log.info("usage %s%s: in=%d cache_read=%d cache_write=%d out=%d (hit %.0f%%)",
+                 key or "-", " [compactada]" if compacted else "", u["input_tokens"],
+                 u["cache_read_input_tokens"], u["cache_creation_input_tokens"], u["output_tokens"],
+                 100 * u["cache_read_input_tokens"] / total)
 
 
 def state_path(key):
@@ -318,7 +355,7 @@ def build_summary(key, msgs, prev):
     """Hilo de fondo: resume msgs[prev.cut:new_cut] sobre el resumen previo y guarda el estado."""
     try:
         start = prev["cut"] if prev else 0
-        cut = choose_cut(msgs, KEEP, min_cut=start + 1)
+        cut = choose_cut(msgs, KEEP / RATIO.get(key, 1.0), min_cut=start + 1)
         if cut is None:
             log.info("%s: sin punto de corte válido", key)
             return
@@ -373,7 +410,7 @@ def transform(body, count_only=False):
                 except OSError:
                     pass
             st = None
-    pending = compactable_tokens(msgs, st["cut"] + 1 if st else 0)
+    pending = compactable_tokens(msgs, st["cut"] + 1 if st else 0) * RATIO.get(key, 1.0)
     if not count_only and pending > TRIGGER:
         with LOCK:
             busy = key in JOBS or time.time() - FAILED.get(key, 0) < RETRY_S
@@ -444,13 +481,33 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n) if n else b""
         path = self.path.split("?")[0]
+        measure = self.command == "POST" and path == "/v1/messages"
+        compacted, key, conv, est = False, None, None, 0.0
         if self.command == "POST" and path in ("/v1/messages", "/v1/messages/count_tokens") and raw:
             STATS["requests"] += 1
             try:
                 body = json.loads(raw)
+                msgs = body.get("messages")
+                if isinstance(msgs, list) and msgs:
+                    conv = conv_key(msgs)
+                    key = conv[:8]
                 new = transform(body, count_only=path.endswith("count_tokens"))
                 if new is not body:
+                    compacted = True
                     raw = json.dumps(new, ensure_ascii=False).encode()
+                if measure:
+                    est = est_body(new)
+                    sz = {k: len(json.dumps(new.get(k, ""), ensure_ascii=False)) // 1000
+                          for k in ("system", "tools", "messages")}
+                    by = {}
+                    for m in new.get("messages") or []:
+                        for b in blocks(m):
+                            if isinstance(b, dict):
+                                t = b.get("type", "?")
+                                by[t] = by.get(t, 0) + len(json.dumps(b, ensure_ascii=False))
+                    key = f"{key} sys={sz['system']}k tools={sz['tools']}k({len(new.get('tools') or [])}) " \
+                          f"msgs={sz['messages']}k({len(new.get('messages') or [])}) est={int(compactable_tokens(new['messages']))} " \
+                          + " ".join(f"{t}={v // 1000}k" for t, v in sorted(by.items()))
             except Exception as e:  # noqa: BLE001 — nunca romper la petición
                 log.warning("transform falló, se reenvía sin tocar: %s", e)
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
@@ -486,10 +543,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             if self.command == "HEAD":
                 return
+            seen = []          # trozos con "usage" (message_start al principio, message_delta al final)
             while True:
                 data = resp.read1(65536)
                 if not data:
                     break
+                if measure and resp.status == 200 and b"_tokens" in data:
+                    seen.append(data[-65536:])
                 if chunked:
                     self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
                 else:
@@ -498,6 +558,12 @@ class Handler(BaseHTTPRequestHandler):
             if chunked:
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
+            if seen:
+                try:
+                    record_usage(parse_usage(b"".join(seen[:1] + seen[-2:])), compacted,
+                                 f"{key} ratio={(RATIO.get(conv) or 0):.2f}", conv, est)
+                except Exception as e:  # noqa: BLE001 — la medición nunca rompe la respuesta
+                    log.warning("usage no medible: %s", e)
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
         finally:
