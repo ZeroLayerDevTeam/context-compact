@@ -1,0 +1,20 @@
+# Copy to /etc/systemd/system/, replace YOUR_USER and the paths, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now compactador
+[Unit]
+Description=context-compact — Anthropic API proxy that compacts the context with Ollama
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=YOUR_USER
+Environment=HOME=/home/YOUR_USER
+Environment=PYTHONUNBUFFERED=1
+# Clients allowed to connect (comma-separated IPs). Default: localhost only.
+#Environment=COMPACTADOR_ALLOW=127.0.0.1,::1,192.168.1.10
+WorkingDirectory=/home/YOUR_USER/context-compact
+ExecStart=/usr/bin/python3 /home/YOUR_USER/context-compact/compactador.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
