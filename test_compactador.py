@@ -110,3 +110,27 @@ class T(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_parse_usage_sse():
+    sse = (b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":12,'
+           b'"cache_creation_input_tokens":300,"cache_read_input_tokens":45000,"output_tokens":1}}}\n\n'
+           b'event: content_block_delta\ndata: {"delta":{"text":"x \\"input_tokens\\": 999"}}\n\n'
+           b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":420}}\n\n')
+    u = c.parse_usage(sse)
+    assert u == {"input_tokens": 12, "cache_read_input_tokens": 45000,
+                 "cache_creation_input_tokens": 300, "output_tokens": 420}
+
+
+def test_ratio_scales_pending():
+    c.RATIO.clear()
+    body = {"messages": [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+                         {"role": "user", "content": "c"}], "tools": [{"name": "x" * 7000}]}
+    est = c.est_body(body)
+    c.record_usage({"input_tokens": 0, "cache_read_input_tokens": int(est * 3),
+                    "cache_creation_input_tokens": 0, "output_tokens": 1}, False, "k", "conv1", est)
+    assert abs(c.RATIO["conv1"] - 3.0) < 0.01
+    c.record_usage({"input_tokens": 0, "cache_read_input_tokens": int(est * 50),
+                    "cache_creation_input_tokens": 0, "output_tokens": 1}, False, "k", "conv1", est)
+    assert c.RATIO["conv1"] == 5.0
+    c.RATIO.clear()
